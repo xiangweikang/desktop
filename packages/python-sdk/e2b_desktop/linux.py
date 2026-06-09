@@ -1,15 +1,15 @@
-import time
 from re import search as re_search
 from shlex import quote as quote_string
-from typing import Callable, Iterator, Literal, Optional, Tuple, Union
+from typing import Iterator, Literal, Optional, Tuple, Union
 from uuid import uuid4
 
 from e2b import (
     CommandExitException,
     CommandHandle,
-    CommandResult,
     TimeoutException,
 )
+
+from .base import BaseDesktopDriver, BaseVNCServer, MouseButton, chunk_text
 
 MOUSE_BUTTONS = {"left": 1, "right": 3, "middle": 2}
 
@@ -78,7 +78,7 @@ def map_key(key: str) -> str:
     return lower_key
 
 
-class LinuxVNCServer:
+class LinuxVNCServer(BaseVNCServer):
     def __init__(self, driver: "LinuxDesktopDriver") -> None:
         self.__novnc_handle: Optional[CommandHandle] = None
 
@@ -110,26 +110,6 @@ class LinuxVNCServer:
 
         characters = string.ascii_letters + string.digits
         return "".join(secrets.choice(characters) for _ in range(length))
-
-    def get_url(
-        self,
-        auto_connect: bool = True,
-        view_only: bool = False,
-        resize: str = "scale",
-        auth_key: Optional[str] = None,
-    ) -> str:
-        params = []
-        if auto_connect:
-            params.append("autoconnect=true")
-        if view_only:
-            params.append("view_only=true")
-        if resize:
-            params.append(f"resize={resize}")
-        if auth_key:
-            params.append(f"password={auth_key}")
-        if params:
-            return f"{self._url}?{'&'.join(params)}"
-        return self._url
 
     def get_auth_key(self) -> str:
         if not self._novnc_password:
@@ -194,7 +174,7 @@ class LinuxVNCServer:
             self.__novnc_handle = None
 
 
-class LinuxDesktopDriver:
+class LinuxDesktopDriver(BaseDesktopDriver):
     def __init__(
         self,
         sandbox,
@@ -213,6 +193,9 @@ class LinuxDesktopDriver:
     def stream(self) -> LinuxVNCServer:
         return self._stream
 
+    def _run_wait_command(self, cmd: str):
+        return self.sandbox.commands.run(cmd)
+
     def start(self) -> None:
         width, height = self.resolution
         xvfb_handle = self.sandbox.commands.run(
@@ -229,26 +212,6 @@ class LinuxDesktopDriver:
             raise TimeoutException("Could not start Xvfb")
 
         self._start_xfce4()
-
-    def _wait_and_verify(
-        self,
-        cmd: str,
-        on_result: Callable[[CommandResult], bool],
-        timeout: int = 10,
-        interval: float = 0.5,
-    ) -> bool:
-        elapsed = 0
-        while elapsed < timeout:
-            try:
-                if on_result(self.sandbox.commands.run(cmd)):
-                    return True
-            except CommandExitException:
-                continue
-
-            time.sleep(interval)
-            elapsed += interval
-
-        return False
 
     def _start_xfce4(self):
         if self._last_xfce4_pid is None or "[xfce4-session] <defunct>" in (
@@ -270,31 +233,14 @@ class LinuxDesktopDriver:
 
         self.sandbox.commands.run(f"scrot --pointer {screenshot_path}")
 
-        file = self.sandbox.files.read(screenshot_path, format=format)
-        self.sandbox.files.remove(screenshot_path)
-        return file
+        return self._read_and_remove_file(screenshot_path, format=format)
 
-    def _move_if_coordinates(self, x: Optional[int], y: Optional[int]) -> None:
-        if (x is None) != (y is None):
-            raise ValueError("Both x and y must be provided together")
-        if x is not None and y is not None:
-            self.move_mouse(x, y)
-
-    def left_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.sandbox.commands.run("xdotool click 1")
+    def _click(self, button: MouseButton = "left") -> None:
+        self.sandbox.commands.run(f"xdotool click {MOUSE_BUTTONS[button]}")
 
     def double_click(self, x: Optional[int] = None, y: Optional[int] = None):
         self._move_if_coordinates(x, y)
         self.sandbox.commands.run("xdotool click --repeat 2 1")
-
-    def right_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.sandbox.commands.run("xdotool click 3")
-
-    def middle_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.sandbox.commands.run("xdotool click 2")
 
     def scroll(self, direction: Literal["up", "down"] = "down", amount: int = 1):
         self.sandbox.commands.run(
@@ -340,11 +286,7 @@ class LinuxDesktopDriver:
             raise RuntimeError(f"Invalid screen size format: {_match.group(1)}") from e
 
     def write(self, text: str, *, chunk_size: int = 25, delay_in_ms: int = 75) -> None:
-        def break_into_chunks(text: str, n: int):
-            for i in range(0, len(text), n):
-                yield text[i : i + n]
-
-        for chunk in break_into_chunks(text, chunk_size):
+        for chunk in chunk_text(text, chunk_size):
             self.sandbox.commands.run(
                 f"xdotool type --delay {delay_in_ms} -- {quote_string(chunk)}"
             )
@@ -356,12 +298,6 @@ class LinuxDesktopDriver:
             key = map_key(key)
 
         self.sandbox.commands.run(f"xdotool key {key}")
-
-    def drag(self, fr: tuple[int, int], to: tuple[int, int]):
-        self.move_mouse(fr[0], fr[1])
-        self.mouse_press()
-        self.move_mouse(to[0], to[1])
-        self.mouse_release()
 
     def wait(self, ms: int):
         self.sandbox.commands.run(f"sleep {ms / 1000}")
@@ -375,13 +311,17 @@ class LinuxDesktopDriver:
 
     def get_application_windows(self, application: str) -> list[str]:
         return (
-            self.sandbox.commands.run(f"xdotool search --onlyvisible --class {application}")
+            self.sandbox.commands.run(
+                f"xdotool search --onlyvisible --class {application}"
+            )
             .stdout.strip()
             .split("\n")
         )
 
     def get_window_title(self, window_id: str) -> str:
-        return self.sandbox.commands.run(f"xdotool getwindowname {window_id}").stdout.strip()
+        return self.sandbox.commands.run(
+            f"xdotool getwindowname {window_id}"
+        ).stdout.strip()
 
     def launch(self, application: str, uri: Optional[str] = None):
         handle = self.sandbox.commands.run(

@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from e2b import CommandExitException, CommandHandle, TimeoutException
 
+from .base import BaseDesktopDriver, BaseVNCServer, MouseButton, chunk_text
 from .powershell import ps_single_quote
 
 DEFAULT_WINDOWS_NOVNC_COMMAND = (
@@ -97,7 +98,7 @@ def _map_sendkeys_key(key: str, *, in_combo: bool = False) -> str:
     raise ValueError(f"Unsupported Windows key: {key}")
 
 
-class WindowsVNCServer:
+class WindowsVNCServer(BaseVNCServer):
     def __init__(
         self,
         driver: "WindowsDesktopDriver",
@@ -132,26 +133,6 @@ if ($null -eq $connection) {{ exit 1 }}
         except CommandExitException:
             return False
 
-    def get_url(
-        self,
-        auto_connect: bool = True,
-        view_only: bool = False,
-        resize: str = "scale",
-        auth_key: Optional[str] = None,
-    ) -> str:
-        params = []
-        if auto_connect:
-            params.append("autoconnect=true")
-        if view_only:
-            params.append("view_only=true")
-        if resize:
-            params.append(f"resize={resize}")
-        if auth_key:
-            params.append(f"password={auth_key}")
-        if params:
-            return f"{self._url}?{'&'.join(params)}"
-        return self._url
-
     def get_auth_key(self) -> str:
         raise RuntimeError("Stream auth keys are not supported on Windows yet")
 
@@ -171,7 +152,9 @@ if ($null -eq $connection) {{ exit 1 }}
         self._url = f"https://{self.__desktop.get_host(self._port)}/vnc.html"
 
         if require_auth:
-            raise NotImplementedError("VNC authentication is not supported on Windows yet")
+            raise NotImplementedError(
+                "VNC authentication is not supported on Windows yet"
+            )
         if self._check_novnc_running():
             raise RuntimeError("Stream is already running")
 
@@ -179,9 +162,7 @@ if ($null -eq $connection) {{ exit 1 }}
             vnc_port=self._vnc_port,
             port=self._port,
         )
-        self.__novnc_handle = self.__driver._run_ps(
-            command, background=True, timeout=0
-        )
+        self.__novnc_handle = self.__driver._run_ps(command, background=True, timeout=0)
         if not self._wait_for_port(self._port):
             raise TimeoutException("Could not start noVNC server")
 
@@ -191,7 +172,7 @@ if ($null -eq $connection) {{ exit 1 }}
             self.__novnc_handle = None
 
 
-class WindowsDesktopDriver:
+class WindowsDesktopDriver(BaseDesktopDriver):
     def __init__(
         self,
         sandbox,
@@ -207,25 +188,11 @@ class WindowsDesktopDriver:
     def _run_ps(self, script: str, **kwargs):
         return self.sandbox.commands.run(script, shell="powershell", **kwargs)
 
-    def _wait_and_verify(
-        self,
-        script: str,
-        on_result,
-        timeout: int = 10,
-        interval: float = 0.5,
-    ) -> bool:
-        elapsed = 0.0
-        while elapsed < timeout:
-            try:
-                if on_result(self._run_ps(script)):
-                    return True
-            except CommandExitException:
-                pass
+    def _run_wait_command(self, cmd: str):
+        return self._run_ps(cmd)
 
-            self.wait(int(interval * 1000))
-            elapsed += interval
-
-        return False
+    def _sleep_between_waits(self, interval: float) -> None:
+        self.wait(int(interval * 1000))
 
     def start(self) -> None:
         self._run_ps("$PSVersionTable.PSVersion.ToString()")
@@ -234,7 +201,9 @@ class WindowsDesktopDriver:
         try:
             return json.loads(stdout.strip())
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"Failed to parse PowerShell JSON output: {stdout}") from e
+            raise RuntimeError(
+                f"Failed to parse PowerShell JSON output: {stdout}"
+            ) from e
 
     def screenshot(
         self,
@@ -257,15 +226,7 @@ $path
 """
         )
         screenshot_path = result.stdout.strip()
-        file = self.sandbox.files.read(screenshot_path, format=format)
-        self.sandbox.files.remove(screenshot_path)
-        return file
-
-    def _move_if_coordinates(self, x: Optional[int], y: Optional[int]) -> None:
-        if (x is None) != (y is None):
-            raise ValueError("Both x and y must be provided together")
-        if x is not None and y is not None:
-            self.move_mouse(x, y)
+        return self._read_and_remove_file(screenshot_path, format=format)
 
     def _mouse_event(self, flag: str, data: int = 0) -> None:
         self._run_ps(
@@ -286,10 +247,9 @@ namespace E2BDesktop {{
 """
         )
 
-    def left_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.mouse_press("left")
-        self.mouse_release("left")
+    def _click(self, button: MouseButton = "left") -> None:
+        self.mouse_press(button)
+        self.mouse_release(button)
 
     def double_click(self, x: Optional[int] = None, y: Optional[int] = None):
         self._move_if_coordinates(x, y)
@@ -297,16 +257,6 @@ namespace E2BDesktop {{
             self.mouse_press("left")
             self.mouse_release("left")
             self.wait(50)
-
-    def right_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.mouse_press("right")
-        self.mouse_release("right")
-
-    def middle_click(self, x: Optional[int] = None, y: Optional[int] = None):
-        self._move_if_coordinates(x, y)
-        self.mouse_press("middle")
-        self.mouse_release("middle")
 
     def scroll(self, direction: Literal["up", "down"] = "down", amount: int = 1):
         delta = 120 * amount if direction == "up" else -120 * amount
@@ -350,8 +300,8 @@ $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
         return int(size["width"]), int(size["height"])
 
     def write(self, text: str, *, chunk_size: int = 25, delay_in_ms: int = 75) -> None:
-        for i in range(0, len(text), chunk_size):
-            chunk = _escape_sendkeys_text(text[i : i + chunk_size])
+        for text_chunk in chunk_text(text, chunk_size):
+            chunk = _escape_sendkeys_text(text_chunk)
             self._run_ps(
                 f"""
 Add-Type -AssemblyName System.Windows.Forms
@@ -372,12 +322,6 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.SendKeys]::SendWait({ps_single_quote(mapped_key)})
 """
         )
-
-    def drag(self, fr: tuple[int, int], to: tuple[int, int]):
-        self.move_mouse(fr[0], fr[1])
-        self.mouse_press()
-        self.move_mouse(to[0], to[1])
-        self.mouse_release()
 
     def wait(self, ms: int):
         self._run_ps(f"Start-Sleep -Milliseconds {ms}")
